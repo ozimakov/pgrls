@@ -10,6 +10,14 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+- **Offline schema source for `lint` / `fix` / `generate`.** New `--sql-file`
+  (raw DDL; repeatable; `-` for stdin) and `--snapshot` flags analyze a schema
+  with no live Postgres and no Docker — promoting the engine the MCP server
+  already ships. Offline runs can only under-report: catalog-only rules are
+  explicitly skipped and surfaced (`skipped_rules` in `--format json`;
+  `lint --require-full-coverage` fails a partial run). `--apply` is rejected
+  offline (emit-only). (#225)
+
 ## [0.41.0] - 2026-06-21
 
 ### Added
