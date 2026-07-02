@@ -78,7 +78,7 @@ def test_schema_to_snapshot_shape() -> None:
     )
     snap: Snapshot = Schema(tables=(table,)).to_snapshot()
     assert snap == {
-        "version": 22,
+        "version": 23,
         "tables": [
             {
                 "schema": "public",
@@ -245,13 +245,14 @@ def test_snapshot_version_is_twenty_one_after_owner_capture() -> None:
     # (pg_get_userbyid(relowner)) plus top-level owner_reachable_members so
     # SEC048 can flag a low-trust role that reaches a non-FORCE'd table owner
     # through membership (owner privileges, unlike the BYPASSRLS attribute, are
-    # inherited). Pin the new version so a future bump is deliberate. (v22
+    # inherited). Pin the new version so a future bump is deliberate. (v23
+    # added View.grants for the VIEW004 verify --mode escalation path; v22
     # added Table.in_publications for SEC051; v21 added Table.owner; v20
     # added foreign_keys for SEC047; v19 added immutable_functions for SEC046;
     # v18 added default_privileges for SEC044; v17 added Table.inherits for
     # SEC043.)
     snap = Schema(tables=()).to_snapshot()
-    assert snap["version"] == 22
+    assert snap["version"] == 23
 
 
 def test_snapshot_in_publications_round_trip() -> None:
@@ -283,6 +284,52 @@ def test_snapshot_in_publications_round_trip() -> None:
         ],
     }
     assert Schema.from_snapshot(legacy).tables[0].in_publications == ()
+
+
+def test_snapshot_view_grants_round_trip() -> None:
+    # v23 per-view `grants` (VIEW004 verify --mode escalation): emitted only
+    # when non-empty, round-trips losslessly, and a pre-v23 snapshot fails
+    # closed to ().
+    exposed = View(
+        schema="public", name="reader_view", is_materialized=False,
+        security_invoker=False, security_barrier=False,
+        definition="SELECT * FROM read_secret()", references=(),
+        security_definer_calls=("public.read_secret",),
+        grants=(
+            Grant(role="PUBLIC", privileges=("SELECT",)),
+            Grant(role="anon", privileges=("SELECT", "INSERT")),
+        ),
+    )
+    plain = View(
+        schema="public", name="plain_view", is_materialized=False,
+        security_invoker=False, security_barrier=False,
+        definition="SELECT 1", references=(), security_definer_calls=(),
+    )
+    snap = Schema(tables=(), views=(exposed, plain)).to_snapshot()
+    assert snap["views"][0]["grants"] == [
+        {"role": "PUBLIC", "privileges": ["SELECT"]},
+        {"role": "anon", "privileges": ["SELECT", "INSERT"]},
+    ]
+    # A view with the default owner-only ACL omits the key entirely.
+    assert "grants" not in snap["views"][1]
+    back = Schema.from_snapshot(snap)
+    assert back.views[0].grants == exposed.grants
+    assert back.views[1].grants == ()
+    # A pre-v23 snapshot (no key on views) decodes to () so the escalation
+    # prover abstains from the view-mediated finding (fail-closed).
+    legacy = {
+        "version": 22,
+        "tables": [],
+        "views": [
+            {
+                "schema": "public", "name": "reader_view",
+                "is_materialized": False, "security_invoker": False,
+                "security_barrier": False, "definition": "SELECT 1",
+                "references": [], "security_definer_calls": [],
+            }
+        ],
+    }
+    assert Schema.from_snapshot(legacy).views[0].grants == ()
 
 
 def test_policy_to_sql_omits_to_clause_when_no_roles() -> None:
@@ -836,7 +883,7 @@ def test_v21_table_owner_and_owner_reachable_members_round_trip() -> None:
         ),
     )
     snap = schema.to_snapshot()
-    assert snap["version"] == 22
+    assert snap["version"] == 23
     assert snap["tables"][0]["owner"] == "app_owner"
     assert snap["owner_reachable_members"] == [
         {
@@ -1026,7 +1073,7 @@ def test_snapshot_v12_top_level_keys_are_stable_contract() -> None:
         "immutable_functions",
         "owner_reachable_members",
     }
-    assert snap["version"] == 22
+    assert snap["version"] == 23
 
 
 def test_snapshot_v7_table_entry_keys_are_stable() -> None:
@@ -1235,6 +1282,10 @@ def test_fully_populated_schema_roundtrip() -> None:
                 definition="SELECT id FROM public.parent",
                 references=(("public", "parent"), ("public", "child")),
                 security_definer_calls=("public.read_secret", "audit.who"),
+                grants=(
+                    Grant(role="PUBLIC", privileges=("SELECT",)),
+                    Grant(role="anon", privileges=("SELECT",)),
+                ),
             ),
         ),
         security_definer_functions=(
@@ -1345,7 +1396,7 @@ def test_column_grants_round_trip_through_snapshot() -> None:
         column_grants=(cg,),
     )
     snap = Schema(tables=(t,)).to_snapshot()
-    assert snap["version"] == SNAPSHOT_VERSION == 22
+    assert snap["version"] == SNAPSHOT_VERSION == 23
     assert snap["tables"][0]["column_grants"] == [
         {"role": "PUBLIC", "column": "ssn", "privileges": ["SELECT"]}
     ]

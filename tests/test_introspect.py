@@ -1062,6 +1062,31 @@ def test_introspect_captures_secdef_function_calls_in_view(
     assert v.security_definer_calls == ("public.read_secret",)
 
 
+def test_introspect_captures_view_grants(
+    pg_conn: psycopg.Connection, apply_sql
+) -> None:
+    # v23: `View.grants` captures pg_class.relacl on the view relation so
+    # `verify --mode escalation` can decide whether an anon session can SELECT
+    # a view that (transitively) calls a SECDEF function reading an RLS table.
+    apply_sql(
+        """
+        CREATE TABLE public.secret (id INT);
+        CREATE VIEW public.exposed_v AS SELECT * FROM public.secret;
+        CREATE VIEW public.private_v AS SELECT * FROM public.secret;
+        GRANT SELECT ON public.exposed_v TO PUBLIC;
+        """
+    )
+    schema = introspect(pg_conn, schemas=["public"])
+    exposed = next(v for v in schema.views if v.name == "exposed_v")
+    assert any(
+        g.role == "PUBLIC" and "SELECT" in g.privileges for g in exposed.grants
+    )
+    # A view with only the default owner-only ACL captures no grants (the
+    # owner self-grant is excluded, mirroring table-grant capture).
+    private = next(v for v in schema.views if v.name == "private_v")
+    assert private.grants == ()
+
+
 def test_introspect_view_calling_invoker_function_no_secdef_entry(
     pg_conn: psycopg.Connection, apply_sql
 ) -> None:

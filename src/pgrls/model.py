@@ -51,7 +51,7 @@ __all__ = [
 PolicyCommand = Literal["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"]
 Snapshot = dict[str, Any]
 
-SNAPSHOT_VERSION = 22  # v22: per-table in_publications (pg_publication_tables)
+SNAPSHOT_VERSION = 23  # v23: per-view grants (pg_class.relacl) for VIEW004 escalation
 # plus top-level owner_reachable_members for SEC048 — a low-trust role that
 # is a transitive pg_auth_members member of a table owner that is NOT
 # superuser/BYPASSRLS bypasses RLS on that owner's enabled-not-forced tables
@@ -323,6 +323,15 @@ class View:
     `security_definer_calls` is the sorted, de-duplicated tuple of
     qualified function names called by the view body that have
     `pg_proc.prosecdef = true`. Both default to empty.
+
+    `grants` is the sorted tuple of privilege grants on the view itself
+    (from `pg_class.relacl`, same shape as `Table.grants`). Captured in
+    snapshot v23+; pre-v23 baselines load with `grants=()`. It lets
+    `verify --mode escalation` decide whether an anonymous session can
+    `SELECT` a view that (transitively) calls a SECURITY DEFINER function
+    reading an RLS-protected table (the VIEW004 view-mediated escalation
+    path). Defaults to empty so callers building a `View(...)` without
+    grants keep working.
     """
 
     schema: str
@@ -333,6 +342,7 @@ class View:
     definition: str
     references: tuple[tuple[str, str], ...]
     security_definer_calls: tuple[str, ...]
+    grants: tuple[Grant, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -1245,6 +1255,10 @@ def _view_from_dict(v: dict[str, Any]) -> View:
         definition=v["definition"],
         references=tuple(tuple(r) for r in v["references"]),
         security_definer_calls=tuple(v["security_definer_calls"]),
+        # v23+ view grants; absent on a pre-v23 baseline → (). Reuses the
+        # table-grant decoder (same validation: >=1 privilege, each a valid
+        # relacl privilege) since view relacl carries the same privilege set.
+        grants=tuple(_grant_from_dict(g) for g in v.get("grants", [])),
     )
 
 
@@ -1743,6 +1757,25 @@ class Schema:
                     "definition": v.definition,
                     "references": [list(ref) for ref in v.references],
                     "security_definer_calls": list(v.security_definer_calls),
+                    # v23: view-level grants (pg_class.relacl). Emitted ONLY
+                    # when present (already sorted at introspection time) so a
+                    # view with the default owner-only ACL — the overwhelming
+                    # majority — serializes byte-identically apart from the
+                    # version bump, mirroring the per-table `in_publications` /
+                    # `foreign_keys` additive fields above.
+                    **(
+                        {
+                            "grants": [
+                                {
+                                    "role": g.role,
+                                    "privileges": list(g.privileges),
+                                }
+                                for g in v.grants
+                            ]
+                        }
+                        if v.grants
+                        else {}
+                    ),
                 }
                 for v in self.views
             ],
@@ -1864,9 +1897,21 @@ class Schema:
 
     @classmethod
     def from_snapshot(cls, payload: dict[str, Any]) -> Schema:
-        """Reconstruct a Schema from a v3-v21 snapshot dict.
+        """Reconstruct a Schema from a v3-v23 snapshot dict.
 
-        v21 (current): adds per-table ``owner``
+        v23 (current): adds per-view ``grants`` (``pg_class.relacl`` on the
+        view relation) for the VIEW004 view-mediated ``verify --mode
+        escalation`` path. Emitted only when non-empty; pre-v23 snapshots
+        have no key on views and load with ``grants=()``, so the escalation
+        prover cannot tell whether a view is anon-``SELECT``-able and abstains
+        from the view-mediated finding until the snapshot is re-captured
+        against a live database (fail-closed).
+
+        v22: adds per-table ``in_publications``
+        (``pg_publication_tables``) for SEC051. Emitted only when non-empty;
+        pre-v22 snapshots have no key and load with ``in_publications=()``.
+
+        v21: adds per-table ``owner``
         (``pg_get_userbyid(relowner)``) plus top-level
         ``owner_reachable_members`` for SEC048. A pre-v21 snapshot has no
         ``owner`` key on tables (loads ``owner=""``) and no
@@ -1965,13 +2010,14 @@ class Schema:
         version = payload.get("version")
         if version not in (
             3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22,
+            21, 22, 23,
         ):
             raise ValueError(
                 f"snapshot version {version!r} is not supported by this "
                 f"pgrls release. Supported versions: 3, 4, 5, 6, 7, 8, 9, "
-                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22. v1 / v2 "
-                "snapshots must be regenerated against the current schema."
+                "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23. "
+                "v1 / v2 snapshots must be regenerated against the current "
+                "schema."
             )
 
         # Build a {(schema, name): [policy_dict, ...]} index from the

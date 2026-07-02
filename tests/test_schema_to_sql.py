@@ -489,7 +489,7 @@ def test_snapshot_version_is_twenty_two():
     # reachability check. (v20 added foreign_keys for SEC047; v19 added
     # immutable_functions for SEC046; v18 added default_privileges for SEC044.)
     # Pin so a future bump is deliberate.
-    assert SNAPSHOT_VERSION == 22
+    assert SNAPSHOT_VERSION == 23
 
 
 def test_to_snapshot_emits_column_details_array():
