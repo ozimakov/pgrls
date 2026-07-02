@@ -751,14 +751,16 @@ def _escalation_probe_one(
     n: int,
 ) -> ProbeResult:
     """Live-confirm one escalation finding. Only the SEC048 owner-reachability
-    LEAKs are probed; a SEC042 SECDEF-body finding (a function qname, absent
-    from `tables`) is skipped (its live confirmation is a follow-on)."""
+    LEAKs are probed; a SECDEF-body finding (SEC042 direct-RPC keyed on a
+    function qname, or VIEW004 view-mediated keyed on a view qname — both
+    absent from `tables`) is skipped (its live confirmation is a follow-on)."""
     qn = tv.qualified_name
     table = tables.get(qn)
     if table is None:
         return ProbeResult(
             qn, None, "escalation", tv.verdict, "skipped", "skipped",
-            "SECDEF-body escalation (SEC042) live confirmation is a follow-on",
+            "SECDEF-body escalation (SEC042 / VIEW004) live confirmation is a "
+            "follow-on",
             None,
         )
     if tv.verdict != "leak":

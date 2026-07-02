@@ -20,6 +20,7 @@ from pgrls.diff._z3_compare import (
 )
 from pgrls.introspect import introspect
 from pgrls.model import (
+    Grant,
     OwnerReachableMember,
     Policy,
     Schema,
@@ -2170,3 +2171,228 @@ def test_escalation_secdef_leak_renders_in_text_and_sarif() -> None:
     assert len(notes) == 1 and "opaque_fn" in json.dumps(notes[0])
     defined = {r["id"] for r in strict["tool"]["driver"]["rules"]}
     assert all(r["ruleId"] in defined for r in strict["results"])
+
+
+# --- escalation mode: VIEW004 view-mediated SECDEF bodies ------------------
+
+
+def _secdef_view(
+    name: str = "reader_view",
+    *,
+    calls: tuple[str, ...] = ("public.read_secret",),
+    grant_roles: tuple[str, ...] = ("anon",),
+    invoker: bool = False,
+) -> View:
+    """An anon-SELECT-able view whose body calls a SECDEF function.
+
+    `grant_roles` become SELECT grants on the view (anon-selectability);
+    `calls` are the SECDEF functions the body invokes; `invoker` toggles
+    `security_invoker`. `references` is left empty — the view reaches the RLS
+    table only through the function, which is exactly the VIEW004 shape."""
+    return View(
+        schema="public",
+        name=name,
+        is_materialized=False,
+        security_invoker=invoker,
+        security_barrier=False,
+        definition="SELECT * FROM read_secret()",
+        references=(),
+        security_definer_calls=calls,
+        grants=tuple(Grant(role=r, privileges=("SELECT",)) for r in grant_roles),
+    )
+
+
+@requires_z3
+def test_escalation_view_calls_secdef_reading_isolated_table_is_leak() -> None:
+    # An anon-SELECT-able (non-invoker) view calls a SECDEF function owned by an
+    # RLS-exempt role reading an anon-ISOLATED table. The function is NOT
+    # directly anon-EXECUTE-able (roles=authenticated), so SEC042 does not fire
+    # — but a non-invoker view runs the call as the view owner, so an anon
+    # SELECT of the view still reads rows its own RLS would deny → LEAK, keyed
+    # on the view.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    v = build_verification(schema, mode="escalation")
+    # No SEC042 finding (function not directly anon-executable); only the view.
+    assert [t.qualified_name for t in v.tables] == ["public.reader_view"]
+    [t] = v.tables
+    assert t.verdict == "leak"
+    assert t.note is not None
+    assert "reader_view" in t.note and "read_secret" in t.note
+    assert "secret" in t.note
+
+
+@requires_z3
+def test_escalation_view_not_anon_selectable_is_no_finding() -> None:
+    # The view grants SELECT only to `authenticated`, never anon/PUBLIC — an
+    # anonymous session can't SELECT it, so it triggers no SECDEF body.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(grant_roles=("authenticated",)),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_view_secdef_via_public_grant_is_leak() -> None:
+    # A SELECT grant to PUBLIC (the default-open case) makes the view
+    # anon-selectable just as an explicit `anon` grant does.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(grant_roles=("PUBLIC",)),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.reader_view"
+    assert t.verdict == "leak"
+
+
+@requires_z3
+def test_escalation_view_secdef_owner_not_rls_exempt_is_no_finding() -> None:
+    # The SECDEF function's owner does NOT bypass RLS, so the call does not
+    # actually bypass the table's RLS → no proven leak.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", bypass=False),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_invoker_view_needs_anon_execute() -> None:
+    # A security_invoker view checks function EXECUTE against the CALLER (anon).
+    # A function not anon-EXECUTE-able is unreachable through an invoker view →
+    # no finding, even though the view is anon-selectable.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(invoker=True),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_invoker_view_with_anon_execute_is_leak() -> None:
+    # A security_invoker view whose called function IS anon-EXECUTE-able: the
+    # caller can execute it, so the bypass is reachable → LEAK.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(invoker=True),),
+        security_definer_functions=(_secdef("SELECT * FROM secret"),),
+    )
+    v = build_verification(schema, mode="escalation")
+    # Both the direct SEC042 finding (function anon-executable) and the
+    # view-mediated finding surface, keyed on their distinct locations.
+    locs = {t.qualified_name: t.verdict for t in v.tables}
+    assert locs == {
+        "public.read_secret": "leak",
+        "public.reader_view": "leak",
+    }
+    [view_t] = [t for t in v.tables if t.qualified_name == "public.reader_view"]
+    assert view_t.note is not None and "security_invoker" in view_t.note
+
+
+@requires_z3
+def test_escalation_view_opaque_secdef_body_is_unverified() -> None:
+    # The called function has an opaque PL/pgSQL body — cannot prove what it
+    # reads → UNVERIFIED (abstain), keyed on the view.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(),),
+        security_definer_functions=(
+            _secdef("BEGIN RETURN; END", lang="plpgsql", roles=("authenticated",)),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.reader_view"
+    assert t.verdict == "unverified"
+    assert t.note is not None and "opaque" in t.note
+
+
+@requires_z3
+def test_escalation_view_secdef_reading_total_anon_leak_is_ceded() -> None:
+    # The read table already leaks every row to anon (USING true), so the
+    # view-mediated bypass exposes nothing new → ISOLATED.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "true"),),
+        views=(_secdef_view(),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    [t] = build_verification(schema, mode="escalation").tables
+    assert t.qualified_name == "public.reader_view"
+    assert t.verdict == "isolated"
+    assert t.note is not None and "nothing new" in t.note
+
+
+@requires_z3
+def test_escalation_anon_view_without_secdef_call_is_no_finding() -> None:
+    # An anon-selectable view that calls no SECDEF function is not a
+    # view-mediated escalation candidate.
+    plain = View(
+        schema="public", name="plain_view", is_materialized=False,
+        security_invoker=False, security_barrier=False,
+        definition="SELECT * FROM secret", references=(("public", "secret"),),
+        security_definer_calls=(),
+        grants=(Grant(role="anon", privileges=("SELECT",)),),
+    )
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(plain,),
+        security_definer_functions=(_secdef("SELECT 1", roles=("authenticated",)),),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+
+
+@requires_z3
+def test_escalation_view_finding_renders_in_text_and_sarif() -> None:
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    v = build_verification(schema, mode="escalation")
+    text = render_text(v)
+    assert "public.reader_view" in text and "LEAK" in text
+
+    run = json.loads(render_sarif(v))["runs"][0]
+    [leak] = [r for r in run["results"] if r["level"] == "error"]
+    assert leak["ruleId"] == "pgrls-escalation-isolation"
+    assert "reader_view" in leak["message"]["text"]
+
+
+@requires_z3
+def test_escalation_view_honors_configured_anon_roles() -> None:
+    # A view SELECT-able only by a renamed anon role (web_anon) is missed under
+    # the default {anon, PUBLIC} but proven when web_anon is configured.
+    schema = Schema(
+        tables=(_anon_tbl("secret", "tenant_id = auth.uid()"),),
+        views=(_secdef_view(grant_roles=("web_anon",)),),
+        security_definer_functions=(
+            _secdef("SELECT * FROM secret", roles=("authenticated",)),
+        ),
+    )
+    assert build_verification(schema, mode="escalation").tables == ()
+    [t] = build_verification(
+        schema, mode="escalation", anon_roles={"web_anon"}
+    ).tables
+    assert t.qualified_name == "public.reader_view"
+    assert t.verdict == "leak"

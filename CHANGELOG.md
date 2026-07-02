@@ -10,6 +10,33 @@ breaking changes — they will be called out in this file.
 
 ## [Unreleased]
 
+### Added
+- **`pgrls verify --mode escalation` now proves the VIEW004 view-mediated
+  case.** An anon-`SELECT`-able view whose body calls a SECURITY DEFINER
+  function owned by an RLS-exempt role (superuser / `BYPASSRLS`) reading an
+  RLS-protected table lets an anonymous `SELECT` of the view run that function
+  as its owner — reading rows the caller's own RLS would deny. This is the
+  view-mediated sibling of the SEC042 direct-RPC finding, keyed on the **view**
+  (the entry point). Reachability is sound-conservative: the view must grant
+  `SELECT` to `anon` / `PUBLIC`, and the function must be reachable through it
+  — a non-`security_invoker` view runs the call as the view owner (no anon
+  `EXECUTE` needed), while a `security_invoker` view additionally requires the
+  function to be anon-`EXECUTE`-able. The read-side rollup reuses the SEC042
+  machinery verbatim (isolated → LEAK, total-anon-leak → ISOLATED, partial →
+  LEAK, opaque/unseen body → UNVERIFIED) and honors the same
+  `[lint.rules.SEC042].anon_roles` exposure set (default `{anon, PUBLIC}`).
+  Closes the last of the three static reachability paths (SEC048, SEC042,
+  VIEW004) targeted by the escalation mode; the SEC042 / VIEW004 `--probe`
+  live-confirmation and `--emit-repro` remain follow-ons. (#232)
+
+### Changed
+- **Snapshot format v22 → v23.** Adds per-view `grants` (`pg_class.relacl` on
+  the view relation, same shape as `Table.grants`) so the escalation prover can
+  tell whether a view is anon-`SELECT`-able. Emitted only when non-empty;
+  pre-v23 snapshots load with `View.grants=()`, so the view-mediated escalation
+  finding fails closed (abstains) until the snapshot is re-captured against a
+  live database. `Schema.from_snapshot` accepts v3–v23.
+
 ## [0.47.0] - 2026-06-29
 
 ### Added

@@ -4199,3 +4199,20 @@ allowlist = ["public.admin_user_summary"]
 
 Same `schema.view` shape as VIEW001 / VIEW002 / VIEW003.
 
+**Proving the leak — `pgrls verify --mode escalation`.** VIEW004 flags
+that the *path exists*; the escalation prover decides whether an
+anonymous caller actually reads rows their own RLS would deny. When the
+view is anon-`SELECT`-able (a `SELECT` grant to `anon` / `PUBLIC`,
+captured in `View.grants` since snapshot v23) and the called function is
+owned by an RLS-exempt role (superuser / `BYPASSRLS`), an anon `SELECT`
+of the view runs the function as its owner — so the prover composes the
+read table's `anon` verdict and reports **LEAK** (the read table isolates
+anon, or only partially leaks), **ISOLATED** (the table already leaks
+every row to anon — the bypass adds nothing), or **UNVERIFIED** (an
+opaque body, or one that reads via a view/function/relation the prover
+cannot see through). Reachability is sound-conservative: a
+`security_invoker` view additionally requires the function to be
+anon-`EXECUTE`-able, since it checks `EXECUTE` against the caller rather
+than the view owner. See the SEC042 direct-RPC sibling for the
+non-view-mediated case.
+

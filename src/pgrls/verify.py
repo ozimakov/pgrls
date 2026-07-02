@@ -391,7 +391,8 @@ def build_escalation(
 
     Only tables owned by a reachable owner appear in the result (the SEC048
     population); a table no low-trust role can reach its owner of is simply not a
-    candidate. SECDEF-body escalation (SEC042 / VIEW004) is out of this v1 scope.
+    candidate. SECDEF-body escalation (SEC042 direct-RPC and VIEW004
+    view-mediated) is appended separately below.
     """
     xt = build_verification(schema, auth_functions=auth_functions, mode="cross-tenant")
     xt_by_table = {t.qualified_name: t for t in xt.tables}
@@ -484,6 +485,13 @@ def build_escalation(
     resolved_anon_roles = anon_roles if anon_roles is not None else {"anon", "PUBLIC"}
     tables.extend(
         _escalation_secdef_findings(schema, auth_functions, resolved_anon_roles)
+    )
+    # VIEW004: an anon-SELECT-able view whose body calls such a SECDEF function
+    # — the view-mediated sibling of the SEC042 direct-RPC finding.
+    tables.extend(
+        _escalation_view_secdef_findings(
+            schema, auth_functions, resolved_anon_roles
+        )
     )
     tables.sort(key=lambda t: t.qualified_name)
     return Verification(tuple(tables), "escalation")
@@ -617,9 +625,9 @@ def _escalation_secdef_findings(
     a known *non-RLS* base table is cleared (not a finding). ``anon_roles`` is
     the SEC042 exposure set (default ``{anon, PUBLIC}``).
 
-    The VIEW004 view-mediated *caller* case (a view selecting a SECDEF call)
-    needs the view's grants to know whether the view is anon-selectable, which
-    the model does not capture, so it is out of this scope.
+    The VIEW004 view-mediated *caller* case (an anon-selectable view whose
+    body calls such a function) is handled separately by
+    `_escalation_view_secdef_findings`, keyed on the view.
     """
     secdef_fns = schema.security_definer_functions
     rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
@@ -699,6 +707,142 @@ def _escalation_secdef_findings(
             findings.append(TableVerdict(qname, "unverified", note, (proof,)))
         # else: every data source is a known non-RLS base table → the body
         # provably reads no protected data → not a finding.
+    return findings
+
+
+def _view_anon_selectable(view: Any, anon_roles: set[str]) -> bool:
+    """Whether an anonymous session can ``SELECT`` `view` — it holds a
+    ``SELECT`` grant to a role in `anon_roles` (``anon`` / ``PUBLIC`` by
+    default). This is the entry-point gate for the VIEW004 escalation: no anon
+    SELECT on the view → an anon caller never triggers its SECDEF body."""
+    return any(
+        g.role in anon_roles and "SELECT" in g.privileges
+        for g in view.grants
+    )
+
+
+def _escalation_view_secdef_findings(
+    schema: Schema, auth_functions: set[str] | None, anon_roles: set[str]
+) -> list[TableVerdict]:
+    """VIEW004 escalation: an anon-``SELECT``-able view whose body calls a
+    SECURITY DEFINER function owned by an RLS-exempt role (superuser /
+    ``BYPASSRLS``), whose body reads an RLS table the anon caller's own RLS
+    would deny. Selecting the view runs the function as its owner, so the
+    anonymous caller reads rows RLS should hide — the *view-mediated* sibling
+    of the SEC042 direct-RPC finding, keyed on the **view** (the entry point).
+
+    Reachability is sound-conservative on two axes:
+
+    * **anon reaches the view** — a ``SELECT`` grant to ``anon`` / ``PUBLIC``
+      (`_view_anon_selectable`). Without it the SECDEF body is never triggered
+      by an anonymous session.
+    * **anon reaches the function through the view** — a non-``security_invoker``
+      view runs its body (and the SECDEF call) with the *view owner's*
+      privileges, so no anon ``EXECUTE`` grant is needed; a ``security_invoker``
+      view checks function ``EXECUTE`` against the *caller*, so the function
+      must additionally be anon-``EXECUTE``-able. Gating on this avoids a false
+      PROVEN-leak on an invoker view whose function anon cannot execute.
+
+    The read-side rollup (isolated / total-anon-leak / partial / opaque) reuses
+    the SEC042 machinery verbatim (`_escalation_anon_rollup`,
+    `_secdef_body_unresolved`), so a body that reads via an unseen
+    view/function is abstained (UNVERIFIED), never false-cleared. `anon_roles`
+    is the SEC042 exposure set (default ``{anon, PUBLIC}``).
+    """
+    views = schema.views
+    secdef_fns = schema.security_definer_functions
+    rls_tables = {(t.schema, t.name) for t in schema.tables if t.rls_enabled}
+    if not views or not secdef_fns or not rls_tables:
+        return []
+    an = build_verification(schema, auth_functions=auth_functions, mode="anon")
+    an_by_table = {t.qualified_name: t for t in an.tables}
+    bare_to_qual: dict[str, list[tuple[str, str]]] = {}
+    for s, n in sorted(rls_tables):
+        bare_to_qual.setdefault(n, []).append((s, n))
+    base_quals = {(t.schema, t.name) for t in schema.tables}
+    base_bares = {t.name for t in schema.tables}
+    import pglast  # noqa: PLC0415 — heavy optional parser path
+    from pgrls.rules.view004 import _secdef_fn_leaks  # noqa: PLC0415 — body parser reuse
+
+    by_qname: dict[str, list[Any]] = {}
+    for f in secdef_fns:
+        by_qname.setdefault(f.qualified_name, []).append(f)
+
+    findings: list[TableVerdict] = []
+    for view in sorted(schema.views, key=lambda v: v.qualified_name):
+        if not view.security_definer_calls:
+            continue
+        if not _view_anon_selectable(view, anon_roles):
+            continue
+        reads: set[str] = set()
+        any_opaque = False
+        any_unseen = False
+        called_fns: set[str] = set()
+        for fn_qname in view.security_definer_calls:
+            # Only overloads owned by an RLS-exempt role bypass RLS; and on a
+            # security_invoker view the caller (anon) must also be able to
+            # EXECUTE the function.
+            candidate = [
+                f
+                for f in by_qname.get(fn_qname, [])
+                if f.owner_bypasses_rls
+                and (
+                    not view.security_invoker
+                    or bool(set(f.execute_roles) & anon_roles)
+                )
+            ]
+            if not candidate:
+                continue
+            called_fns.add(fn_qname)
+            for f in candidate:
+                if not _sql_body_parses(f):
+                    any_opaque = True
+                    continue
+                reads |= _secdef_fn_leaks(f, fn_qname, rls_tables, bare_to_qual)
+                parsed = pglast.parse_sql(f.body)
+                if _secdef_body_unresolved(parsed, base_quals, base_bares):
+                    any_unseen = True
+        if not called_fns:
+            continue
+        inconclusive = any_opaque or any_unseen
+        invoker = " (security_invoker)" if view.security_invoker else ""
+        head = (
+            f"anon-SELECT-able view {view.qualified_name}{invoker} calls "
+            f"SECURITY DEFINER function {', '.join(sorted(called_fns))}, "
+            "owned by an RLS-exempt role"
+        )
+        if reads:
+            verdict, witness, tail = _escalation_anon_rollup(reads, an_by_table)
+            if inconclusive and verdict == "isolated":
+                verdict, witness, tail = (
+                    "unverified",
+                    None,
+                    " — but a called function has an opaque body or reads via "
+                    "an unseen view/function that may read an RLS table",
+                )
+            note = f"{head}, reads {', '.join(sorted(reads))}{tail}"
+            reason = tail.strip(" —") if verdict == "unverified" else None
+            proof = PolicyProof(sorted(reads)[0], verdict, witness, reason)
+            findings.append(
+                TableVerdict(view.qualified_name, verdict, note, (proof,))
+            )
+        elif inconclusive:
+            why = (
+                "a called function has an opaque body (PL/pgSQL or dynamic SQL)"
+                if any_opaque and not any_unseen
+                else "a called function reads via a view, a function, or a "
+                "relation outside the analyzed schema"
+                if any_unseen and not any_opaque
+                else "a called function has an opaque body and reads via an "
+                "unseen view/function"
+            )
+            note = f"{head}, {why} — cannot prove what it reads"
+            proof = PolicyProof(view.qualified_name, "unverified", None, why)
+            findings.append(
+                TableVerdict(view.qualified_name, "unverified", note, (proof,))
+            )
+        # else: every called function's every source is a known non-RLS base
+        # table → provably reads no protected data → not a finding.
     return findings
 
 
