@@ -981,3 +981,54 @@ These are intentional in the current release. Do not invent capabilities.
 - README: <https://github.com/pgrls/pgrls#readme>
 - Issues: <https://github.com/pgrls/pgrls/issues>
 - PyPI: <https://pypi.org/project/pgrls/>
+
+## Cursor Cloud specific instructions
+
+The primary product is the Python `pgrls` CLI (there is no long-running
+server). Dependencies are managed with **uv**; the startup update script runs
+`uv sync --all-extras`, which creates `.venv/` from `pyproject.toml`. Run every
+command through `uv run` (e.g. `uv run pgrls …`, `uv run pytest …`). Canonical
+lint/test commands live in `.github/workflows/test.yml` and `CONTRIBUTING.md` —
+follow those; the notes below only cover non-obvious cloud caveats.
+
+### Services are NOT auto-started on VM boot
+
+A snapshot restores disk, not running processes, and this VM has no systemd
+service manager. Start what you need at the beginning of a session:
+
+- **Postgres 15+ (required for anything that touches a DB — `lint`, `fix`,
+  `verify`, `diff`, and the integration tests).** A local PostgreSQL 16
+  cluster is installed. Start it with `sudo pg_ctlcluster 16 main start`. The
+  superuser is `postgres`/`postgres` on `localhost:5432`; connect via
+  `postgresql://postgres:postgres@localhost:5432/postgres`.
+- **Docker (only for the ~handful of testcontainer-backed tests).** Installed
+  but not running. Start it with
+  `sudo bash -c 'nohup dockerd > /var/log/dockerd.log 2>&1 &'`. The `ubuntu`
+  user is in the `docker` group, but a shell that started before the group was
+  added must wrap docker/pytest calls in `sg docker -c '…'` (or `newgrp
+  docker`) to pick it up. Without Docker, the testcontainer tests
+  (`tests/diff/test_cli_apply.py`, the `test_schema_to_sql.py` round-trip, and
+  the live `ephemeral`/`perf`/`repro`/`verify` cases) hard-fail or skip; every
+  other test passes against the local Postgres.
+
+### Test DB wiring (which env var each suite reads)
+
+- `tests/` and `corpus/` read **`PGRLS_TEST_DATABASE_URL`** to reuse an
+  existing Postgres and skip spawning a testcontainer.
+- `demo/` reads **`DATABASE_URL`** (a different variable) for the same purpose.
+
+Example: `PGRLS_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres uv run pytest tests/ -q`.
+
+### Gotcha: the suite leaks cluster-global roles across sessions
+
+`tests/conftest.py::pg_conn` resets **schemas** between tests but not
+cluster-global **roles**. Running the full `tests/` suite more than once
+against the *same persistent* Postgres accumulates roles (`anon`,
+`authenticated`, `role_a`, …) and the next run fails with `role "…" already
+exists` (e.g. `test_lint_fires_every_registered_rule_in_combined_fixture`).
+This is a persistent-DB artifact, not a code bug — CI is green because each job
+gets a fresh container. Before a repeat full run, drop the leaked roles
+(iterate `pg_roles` where `rolname NOT LIKE 'pg_%' AND rolname <> 'postgres'`,
+`DROP OWNED BY` + `DROP ROLE`), recreate the database, or let testcontainers
+provide a throwaway Postgres (unset the `*DATABASE_URL` var with Docker
+running).
